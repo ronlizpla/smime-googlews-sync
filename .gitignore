@@ -1,0 +1,37 @@
+# Credentials & secrets - NEVER commit these
+credentials.json
+*.json
+!requirements*.json
+
+# Certificate files - sensitive private keys
+*.p12
+*.pfx
+*.pem
+*.key
+*.crt
+*.csr
+*.srl
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+venv/
+.venv/
+env/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Installers
+*.exe
+*.msi
