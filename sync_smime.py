@@ -11,6 +11,8 @@ import argparse
 import logging
 import base64
 import traceback
+import csv
+from datetime import datetime
 from pathlib import Path
 
 # Setup logging
@@ -114,29 +116,47 @@ def extract_email_from_p12(file_path: Path, password: bytes) -> tuple:
 
     raise ValueError("Could not find a valid email address in SAN or CN of the certificate.")
 
-def process_certificate_file(file_path: Path, password: str, credentials_path: str, dry_run: bool, set_default: bool):
+def process_certificate_file(file_path: Path, password: str, credentials_path: str, dry_run: bool, set_default: bool) -> dict:
     """
     Processes a single certificate: extracts email, verifies credentials, and uploads to Google Workspace.
     """
     logger.info(f"Processing certificate: {file_path.name}")
-    
+
+    result = {
+        "file": file_path.name,
+        "email": "",
+        "subject": "",
+        "valid_from": "",
+        "valid_until": "",
+        "status": "FAILED",
+        "cert_id": "",
+        "reason": ""
+    }
+
     password_bytes = password.encode("utf-8") if password else None
-    
+
     try:
         email, cert = extract_email_from_p12(file_path, password_bytes)
+        result["email"] = email
+        result["subject"] = cert.subject.rfc4514_string()
+        result["valid_from"] = str(cert.not_valid_before_utc)
+        result["valid_until"] = str(cert.not_valid_after_utc)
         logger.info(f"  Extracted owner email: {email}")
         logger.info(f"  Cert Subject: {cert.subject.rfc4514_string()}")
         logger.info(f"  Valid From:   {cert.not_valid_before_utc}")
         logger.info(f"  Valid Until:  {cert.not_valid_after_utc}")
     except Exception as e:
+        result["reason"] = f"Parse error: {e}"
         logger.error(f"  Failed parsing certificate {file_path.name}: {e}")
         if logger.isEnabledFor(logging.DEBUG):
             traceback.print_exc()
-        return False
+        return result
 
     if dry_run:
+        result["status"] = "DRY-RUN"
+        result["reason"] = "Dry-run mode — no upload performed"
         logger.info(f"  [DRY-RUN] Would upload certificate for user: {email}")
-        return True
+        return result
 
     # Run the actual API calls
     try:
@@ -173,27 +193,39 @@ def process_certificate_file(file_path: Path, password: str, credentials_path: s
         # Read file bytes for uploading
         with open(file_path, "rb") as f:
             raw_data = f.read()
-        
+
         # Base64url-encode the PKCS#12 payload as required by Google API
         b64_payload = base64.urlsafe_b64encode(raw_data).decode("utf-8")
 
         # Construct SmimeInfo resource
-        smime_body = {
-            "pkcs12": b64_payload
-        }
+        smime_body = {"pkcs12": b64_payload}
         if password:
             smime_body["encryptedKeyPassword"] = password
 
         # Insert S/MIME certificate
         logger.info(f"  Uploading S/MIME key to Gmail for alias: {matching_alias}...")
-        insert_result = service.users().settings().sendAs().smimeInfo().insert(
-            userId="me",
-            sendAsEmail=matching_alias,
-            body=smime_body
-        ).execute()
-
-        cert_id = insert_result.get("id")
-        logger.info(f"  Successfully uploaded certificate! ID: {cert_id}")
+        try:
+            insert_result = service.users().settings().sendAs().smimeInfo().insert(
+                userId="me",
+                sendAsEmail=matching_alias,
+                body=smime_body
+            ).execute()
+            cert_id = insert_result.get("id")
+            result["cert_id"] = cert_id or ""
+            logger.info(f"  Successfully uploaded certificate! ID: {cert_id}")
+        except HttpError as he:
+            error_content = str(he)
+            if he.resp.status == 400 and "already saved" in error_content.lower():
+                logger.info(f"  Certificate already exists for {matching_alias} — skipping (already in sync).")
+                result["status"] = "ALREADY_EXISTS"
+                result["reason"] = "Certificate already uploaded to this account"
+                return result
+            elif he.resp.status == 403 and "Feature not enabled" in error_content:
+                result["reason"] = "S/MIME feature not enabled — check Enterprise license is assigned to this user"
+                logger.error(f"  S/MIME feature not enabled for {email}. Check Enterprise Standard/Plus license is assigned.")
+                raise
+            else:
+                raise
 
         # Set as default if requested
         if set_default:
@@ -205,13 +237,32 @@ def process_certificate_file(file_path: Path, password: str, credentials_path: s
             ).execute()
             logger.info("  Set as default successfully.")
 
-        return True
+        result["status"] = "SUCCESS"
+        result["reason"] = "Uploaded and set as default" if set_default else "Uploaded"
+        return result
 
     except Exception as e:
+        if not result["reason"]:
+            result["reason"] = str(e)
         logger.error(f"  Failed uploading certificate for {email}: {e}")
         if logger.isEnabledFor(logging.DEBUG):
             traceback.print_exc()
-        return False
+        return result
+
+def write_csv_report(results: list, output_dir: Path):
+    """
+    Writes a timestamped CSV report of sync results to the output directory.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = output_dir / f"smime_sync_report_{timestamp}.csv"
+    fieldnames = ["file", "email", "status", "reason", "cert_id", "valid_from", "valid_until", "subject"]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+    logger.info(f"  CSV report saved: {csv_path}")
+    return csv_path
+
 
 def main():
     args = parse_args()
@@ -253,28 +304,39 @@ def main():
 
     logger.info(f"Found {len(cert_files)} certificate file(s).")
     
+    results = []
     success_count = 0
     fail_count = 0
+    already_count = 0
 
     for file_path in cert_files:
-        success = process_certificate_file(
+        result = process_certificate_file(
             file_path=file_path,
             password=password,
             credentials_path=str(credentials_path),
             dry_run=args.dry_run,
             set_default=args.default
         )
-        if success:
+        results.append(result)
+        if result["status"] in ("SUCCESS", "DRY-RUN", "ALREADY_EXISTS"):
             success_count += 1
+            if result["status"] == "ALREADY_EXISTS":
+                already_count += 1
         else:
             fail_count += 1
 
     logger.info("==================================================")
     logger.info("Sync Execution Report:")
     logger.info(f"  Total Processed: {len(cert_files)}")
-    logger.info(f"  Successful:      {success_count}")
+    logger.info(f"  Successful:      {success_count}" + (f" ({already_count} already existed)" if already_count else ""))
     logger.info(f"  Failed:          {fail_count}")
+    for r in results:
+        icon = "✓" if r["status"] in ("SUCCESS", "ALREADY_EXISTS") else ("~" if r["status"] == "DRY-RUN" else "✗")
+        logger.info(f"  [{icon}] {r['email'] or r['file']:40s}  {r['status']}  {r['reason']}")
     logger.info("==================================================")
+
+    # Write CSV report
+    write_csv_report(results, certs_dir)
 
     if fail_count > 0:
         sys.exit(1)

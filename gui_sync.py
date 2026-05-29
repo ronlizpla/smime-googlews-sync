@@ -244,42 +244,69 @@ class SMIMEGuiApp(ctk.CTk):
             return
 
         sync_smime.logger.info(f"Found {len(cert_files)} certificate file(s).")
-        
+
+        results = []
         success_count = 0
         fail_count = 0
+        already_count = 0
 
         for file_path in cert_files:
-            success = sync_smime.process_certificate_file(
+            result = sync_smime.process_certificate_file(
                 file_path=file_path,
                 password=password,
                 credentials_path=creds_path,
                 dry_run=dry_run,
                 set_default=set_default
             )
-            if success:
+            results.append(result)
+            if result["status"] in ("SUCCESS", "DRY-RUN", "ALREADY_EXISTS"):
                 success_count += 1
+                if result["status"] == "ALREADY_EXISTS":
+                    already_count += 1
             else:
                 fail_count += 1
 
         sync_smime.logger.info("==================================================")
         sync_smime.logger.info("Sync Execution Report:")
         sync_smime.logger.info(f"  Total Processed: {len(cert_files)}")
-        sync_smime.logger.info(f"  Successful:      {success_count}")
+        sync_smime.logger.info(f"  Successful:      {success_count}" + (f" ({already_count} already existed)" if already_count else ""))
         sync_smime.logger.info(f"  Failed:          {fail_count}")
+        for r in results:
+            icon = "\u2713" if r["status"] in ("SUCCESS", "ALREADY_EXISTS") else ("~" if r["status"] == "DRY-RUN" else "\u2717")
+            sync_smime.logger.info(f"  [{icon}] {r['email'] or r['file']:40s}  {r['status']}  {r['reason']}")
         sync_smime.logger.info("==================================================")
 
-        self.finalize_sync(success_count, fail_count)
+        # Write CSV report
+        if not dry_run:
+            csv_path = sync_smime.write_csv_report(results, certs_dir)
+            sync_smime.logger.info(f"  Report saved: {csv_path}")
 
-    def finalize_sync(self, success, failed):
-        # Safely re-enable button and show status
+        self.finalize_sync(success_count, fail_count, already_count, results)
+
+    def finalize_sync(self, success, failed, already=0, results=None):
         def cb():
             self.sync_btn.configure(state="normal", text="Start S/MIME Sync Process")
-            status_text = "Sync Complete!"
-            if failed > 0:
-                status_text += f" ({failed} errors)"
-            
-            # Simple Tkinter message popup
-            messagebox.showinfo("Status Report", f"Execution finished.\n\nSuccessful: {success}\nFailed: {failed}")
+
+            # Build per-user summary table
+            lines = []
+            if results:
+                lines.append(f"{'Email':<38} {'Status':<16} Notes")
+                lines.append("-" * 80)
+                for r in results:
+                    icon = "\u2713" if r["status"] in ("SUCCESS", "ALREADY_EXISTS") else ("~" if r["status"] == "DRY-RUN" else "\u2717")
+                    email = r["email"] or r["file"]
+                    lines.append(f"[{icon}] {email:<36} {r['status']:<16} {r['reason']}")
+                lines.append("")
+
+            summary = "\n".join(lines)
+            summary += f"Total: {success + failed}  |  ✓ Success: {success}" 
+            if already:
+                summary += f" ({already} already existed)"
+            summary += f"  |  \u2717 Failed: {failed}"
+            if not any(r.get("status") == "DRY-RUN" for r in (results or [])):
+                summary += "\n\nA CSV report has been saved in the certificates folder."
+
+            messagebox.showinfo("Sync Complete", summary)
 
         self.sync_btn.after(0, cb)
 
