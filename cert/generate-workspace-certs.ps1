@@ -32,6 +32,21 @@ if (-not (Test-Path $caKey) -or -not (Test-Path $caCrt)) {
     & $openssl req -x509 -new -nodes -newkey rsa:4096 -keyout $caKey -out $caCrt -days 3650 -subj "/CN=Mieteora Test Root CA/O=Mieteora/C=US" -config $confFile -extensions ca_ext
 }
 
+# Ensure Intermediate CA exists, if not generate it
+$intKey = Join-Path $scriptDir "intermediate.key"
+$intCrt = Join-Path $scriptDir "intermediate.crt"
+$intCsr = Join-Path $scriptDir "intermediate.csr"
+if (-not (Test-Path $intKey) -or -not (Test-Path $intCrt)) {
+    Write-Host "Creating Intermediate CA..."
+    & $openssl genrsa -out $intKey 4096
+    & $openssl req -new -key $intKey -out $intCsr -subj "/CN=Mieteora Test Intermediate CA/O=Mieteora/C=US" -config $confFile
+    & $openssl x509 -req -in $intCsr -CA $caCrt -CAkey $caKey -CAcreateserial -out $intCrt -days 1825 -extfile $confFile -extensions intermediate_ext
+}
+
+# Create a combined chain file for bundling
+$chainCrt = Join-Path $scriptDir "chain.crt"
+Get-Content $intCrt, $caCrt | Out-File $chainCrt -Encoding utf8
+
 # Create output directory for Workspace API packages
 $outputDir = Join-Path $scriptDir "workspace_packages"
 if (-not (Test-Path $outputDir)) {
@@ -61,8 +76,9 @@ foreach ($email in $Emails) {
     # Generate User Cert
     & $openssl genrsa -out $userKey 2048
     & $openssl req -new -key $userKey -out $userCsr -subj "/CN=$cn/emailAddress=$email/O=Mieteora/C=US" -config $confFile
-    & $openssl x509 -req -in $userCsr -CA $caCrt -CAkey $caKey -CAcreateserial -out $userCrt -days 365 -extfile $confFile -extensions smime_ext
-    & $openssl pkcs12 -export -out $userPfx -inkey $userKey -in $userCrt -certfile $caCrt -passout "pass:$Password"
+    & $openssl x509 -req -in $userCsr -CA $intCrt -CAkey $intKey -CAcreateserial -out $userCrt -days 365 -extfile $confFile -extensions smime_ext
+    & $openssl pkcs12 -export -out $userPfx -inkey $userKey -in $userCrt -certfile $chainCrt -passout "pass:$Password"
+
 
     # Clean up intermediate csr/key/crt files if we only need PFX/JSON, or keep them?
     # Let's keep them so the user has full access to the keys and raw certs as well.

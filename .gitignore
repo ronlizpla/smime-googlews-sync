@@ -35,3 +35,9 @@ Thumbs.db
 # Installers
 *.exe
 *.msi
+
+# Generated reports & workspace packages
+*smime_sync_report*.csv
+cert/workspace_packages/
+cert/chain.crt
+
