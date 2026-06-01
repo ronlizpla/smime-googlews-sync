@@ -1,46 +1,67 @@
-# Refresh PATH from registry so gcloud is available
-$userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-$machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-$env:Path = "$userPath;$machinePath"
+#Requires -Version 5.1
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [string]$ProjectId         = "smime-cert-sync",
+    [string]$ServiceAccountName = "smime-sync-bot",
+    [string]$KeyOutputPath     = ".\credentials.json"
+)
 
-$projId = "smime-cert-sync"
-$saName = "smime-sync-bot"
-$saEmail = "$saName@$projId.iam.gserviceaccount.com"
-$keyFile = "credentials.json"
+$ErrorActionPreference = "Stop"
 
-Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "Configuring Project: $projId"
-Write-Host "=========================================" -ForegroundColor Cyan
+$env:Path = [System.Environment]::GetEnvironmentVariable("Path","User") + ";" +
+            [System.Environment]::GetEnvironmentVariable("Path","Machine")
+
+$saEmail = "$ServiceAccountName@$ProjectId.iam.gserviceaccount.com"
+
+function Fail([string]$msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
+
+if (-not (Get-Command gcloud -ErrorAction SilentlyContinue)) {
+    Fail "gcloud CLI not found."
+}
+if (Test-Path $KeyOutputPath) {
+    Fail "'$KeyOutputPath' already exists. Remove it first."
+}
+
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host " Configuring Project: $ProjectId"
+Write-Host "==========================================" -ForegroundColor Cyan
 
 # Step 1: Set active project
-Write-Host "Step 1: Setting active gcloud project to '$projId'..." -ForegroundColor Yellow
-gcloud config set project $projId
+Write-Host "Step 1: Setting project..." -ForegroundColor Yellow
+gcloud config set project $ProjectId
+if ($LASTEXITCODE -ne 0) { Fail "Could not set project." }
 
 # Step 2: Enable Gmail API
 Write-Host "Step 2: Enabling Gmail API..." -ForegroundColor Yellow
-gcloud services enable gmail.googleapis.com --project=$projId
+gcloud services enable gmail.googleapis.com --project=$ProjectId
+if ($LASTEXITCODE -ne 0) { Fail "Failed to enable Gmail API." }
 
-# Step 3: Create Service Account (skip if exists)
-Write-Host "Step 3: Creating Service Account '$saName'..." -ForegroundColor Yellow
-$saExists = gcloud iam service-accounts list --project=$projId --filter="email:$saEmail" --format="value(email)" 2>$null
-if ($saExists -match $saName) {
-    Write-Host "  Service account already exists. Skipping."
+# Step 3: Create SA (idempotent)
+Write-Host "Step 3: Creating service account '$ServiceAccountName'..." -ForegroundColor Yellow
+$saExists = gcloud iam service-accounts list --project=$ProjectId `
+    --filter="email:$saEmail" --format="value(email)" 2>$null
+if ($saExists -match $ServiceAccountName) {
+    Write-Host "  Service account already exists — skipping." -ForegroundColor Green
 } else {
-    gcloud iam service-accounts create $saName --display-name="SMIME Sync Bot" --project=$projId
+    gcloud iam service-accounts create $ServiceAccountName `
+        --display-name="SMIME Sync Bot" --project=$ProjectId
+    if ($LASTEXITCODE -ne 0) { Fail "Service account creation failed." }
+    Write-Host "  Waiting 15 s for propagation..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 15
 }
 
 # Step 4: Generate JSON key
-Write-Host "Step 4: Generating credentials.json key file..." -ForegroundColor Yellow
-gcloud iam service-accounts keys create $keyFile --iam-account=$saEmail --project=$projId
+Write-Host "Step 4: Generating credentials.json key..." -ForegroundColor Yellow
+gcloud iam service-accounts keys create $KeyOutputPath `
+    --iam-account=$saEmail --project=$ProjectId
+if ($LASTEXITCODE -ne 0) { Fail "Key generation failed." }
 
-if (Test-Path $keyFile) {
-    $json = Get-Content $keyFile -Raw | ConvertFrom-Json
-    Write-Host "=========================================" -ForegroundColor Green
-    Write-Host "SUCCESS: credentials.json created!" -ForegroundColor Green
-    Write-Host "Client ID: $($json.client_id)" -ForegroundColor Yellow
-    Write-Host "=========================================" -ForegroundColor Green
-} else {
-    Write-Host "ERROR: credentials.json was NOT created." -ForegroundColor Red
-    Write-Host "Check if the org policy 'iam.disableServiceAccountKeyCreation' is still enforced on project $projId" -ForegroundColor Red
-    exit 1
-}
+if (-not (Test-Path $KeyOutputPath)) { Fail "Key file was not written." }
+$json = Get-Content $KeyOutputPath -Raw | ConvertFrom-Json
+if (-not $json.client_id) { Fail "client_id missing in key file." }
+
+Write-Host "==========================================" -ForegroundColor Green
+Write-Host " SUCCESS: credentials.json created!"       -ForegroundColor Green
+Write-Host " Client ID: $($json.client_id)"            -ForegroundColor Yellow
+Write-Host "==========================================" -ForegroundColor Green
+Write-Host "Keep '$KeyOutputPath' SECRET. Add to .gitignore." -ForegroundColor Red
