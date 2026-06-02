@@ -31,6 +31,7 @@ logger = logging.getLogger("smime_sync")
 
 try:
     from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.serialization import pkcs12
     from cryptography.x509.oid import ExtensionOID, NameOID
 except ImportError:
@@ -49,6 +50,13 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/gmail.settings.sharing",
 ]
+
+# Randomized exponential backoff applied by googleapiclient to transient
+# failures (429 rate limits, 5xx). Important for bulk runs across many users.
+API_NUM_RETRIES = 5
+
+# Optional per-certificate password file expected in the certificate directory.
+PASSWORD_MANIFEST_NAME = "passwords.csv"
 
 
 def parse_args() -> argparse.Namespace:
@@ -70,16 +78,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def extract_email_from_p12(file_path: Path, password: bytes) -> tuple:
+def extract_p12_info(p12_data: bytes, password: bytes) -> tuple:
     """
-    Decrypts a PKCS#12 file and extracts the owner email from SAN or CN.
-    Returns (email_str, certificate_object).
+    Decrypts PKCS#12 bytes and extracts the owner email from SAN or CN.
+    Returns (email_str, certificate_object, chain_list).
+    `chain_list` holds any additional (intermediate/root) certificates bundled
+    in the PFX — Google Workspace requires at least one intermediate.
     Raises ValueError if no email can be found.
     """
-    with open(file_path, "rb") as f:
-        p12_data = f.read()
-
-    private_key, certificate, _chain = pkcs12.load_key_and_certificates(p12_data, password)
+    private_key, certificate, chain = pkcs12.load_key_and_certificates(p12_data, password)
 
     if not certificate:
         raise ValueError("No certificate found inside the PKCS#12 file.")
@@ -89,20 +96,52 @@ def extract_email_from_p12(file_path: Path, password: bytes) -> tuple:
         san_ext = certificate.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
         emails = [n.value for n in san_ext.value if isinstance(n, x509.RFC822Name)]
         if emails:
-            return emails[0].strip(), certificate
+            return emails[0].strip(), certificate, (chain or [])
     except x509.ExtensionNotFound:
         pass
     except Exception as exc:
-        logger.debug("Failed extracting email from SAN for %s: %s", file_path.name, exc)
+        logger.debug("Failed extracting email from SAN: %s", exc)
 
     # 2. Fallback: Common Name containing @
     for attr in certificate.subject:
         if attr.oid == NameOID.COMMON_NAME:
             cn = attr.value.strip()
             if "@" in cn:
-                return cn, certificate
+                return cn, certificate, (chain or [])
 
     raise ValueError("No valid email address found in SAN or CN of the certificate.")
+
+
+def load_password_manifest(certs_dir: Path) -> dict:
+    """
+    Reads an optional `passwords.csv` (headers: file,password) from certs_dir,
+    mapping each certificate filename to its PKCS#12 password. Files not listed
+    fall back to the global password. Returns {} if no manifest is present.
+    """
+    manifest_path = certs_dir / PASSWORD_MANIFEST_NAME
+    mapping: dict = {}
+    if not manifest_path.exists():
+        return mapping
+
+    # utf-8-sig strips the BOM that Excel prepends when saving CSVs.
+    with open(manifest_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        headers = [h.strip().lower() for h in (reader.fieldnames or [])]
+        if "file" not in headers:
+            logger.warning(
+                "%s found but missing a 'file' column — ignoring it.", PASSWORD_MANIFEST_NAME
+            )
+            return mapping
+        for row in reader:
+            row_l = {(k.strip().lower() if k else k): (v or "") for k, v in row.items()}
+            fname = row_l.get("file", "").strip()
+            if fname:
+                mapping[fname] = row_l.get("password", "")
+
+    logger.info("Loaded password manifest with %d entr%s.",
+                len(mapping), "y" if len(mapping) == 1 else "ies")
+    return mapping
+
 
 
 def validate_credentials_file(credentials_path: Path) -> dict:
@@ -121,13 +160,15 @@ def validate_credentials_file(credentials_path: Path) -> dict:
 def process_certificate_file(
     file_path: Path,
     password: str,
-    credentials_path: str,
+    base_credentials,
     dry_run: bool,
     set_default: bool,
 ) -> dict:
     """
     Processes a single certificate: extract email, then upload to Google Workspace.
-    Returns a result dict with status, email, cert metadata, and reason.
+    `base_credentials` is a scoped service_account.Credentials object (loaded once
+    by the caller); this function derives a per-user impersonation via with_subject().
+    It is None during a dry-run. Returns a result dict with status/metadata/reason.
     """
     logger.info("Processing certificate: %s", file_path.name)
 
@@ -146,7 +187,9 @@ def process_certificate_file(
 
     # ── Parse certificate ──────────────────────────────────────────────────────
     try:
-        email, cert = extract_email_from_p12(file_path, password_bytes)
+        with open(file_path, "rb") as f:
+            raw_data = f.read()
+        email, cert, chain = extract_p12_info(raw_data, password_bytes)
         result["email"] = email
         result["subject"] = cert.subject.rfc4514_string()
         result["valid_from"] = str(cert.not_valid_before_utc)
@@ -155,10 +198,16 @@ def process_certificate_file(
         logger.info("  Cert Subject    : %s", cert.subject.rfc4514_string())
         logger.info("  Valid From      : %s", cert.not_valid_before_utc)
         logger.info("  Valid Until     : %s", cert.not_valid_after_utc)
+        logger.info("  Chain certs     : %d", len(chain))
 
         # Warn if cert is already expired
         if cert.not_valid_after_utc < datetime.now(timezone.utc):
             logger.warning("  Certificate is EXPIRED. Upload will likely be rejected by Google.")
+
+        # Warn if no intermediate is bundled — the #1 cause of Workspace rejection.
+        if not chain:
+            logger.warning("  PFX contains NO chain certificates. Google Workspace "
+                           "requires an intermediate CA; upload will likely be rejected.")
 
     except Exception as exc:
         result["reason"] = f"Parse error: {exc}"
@@ -170,22 +219,25 @@ def process_certificate_file(
     # ── Dry-run: stop here ─────────────────────────────────────────────────────
     if dry_run:
         result["status"] = "DRY-RUN"
-        result["reason"] = "Dry-run — no upload performed"
+        if not chain:
+            result["reason"] = "Dry-run — WARNING: no intermediate chain in PFX (likely rejected)"
+        else:
+            result["reason"] = "Dry-run — no upload performed"
         logger.info("  [DRY-RUN] Would upload certificate for: %s", email)
         return result
 
     # ── Live upload ────────────────────────────────────────────────────────────
     try:
-        creds = service_account.Credentials.from_service_account_file(
-            credentials_path,
-            scopes=SCOPES,
-            subject=email,
-        )
+        creds = base_credentials.with_subject(email)
         service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        smime_api = service.users().settings().sendAs().smimeInfo()
 
         # Retrieve sendAs list to confirm alias exists
         try:
-            send_as_response = service.users().settings().sendAs().list(userId="me").execute()
+            send_as_response = (
+                service.users().settings().sendAs()
+                .list(userId="me").execute(num_retries=API_NUM_RETRIES)
+            )
         except HttpError as he:
             if he.resp.status == 403:
                 result["reason"] = (
@@ -212,10 +264,32 @@ def process_certificate_file(
             logger.error("  %s", result["reason"])
             return result
 
-        # Build upload payload
-        with open(file_path, "rb") as f:
-            raw_data = f.read()
+        # Idempotency: skip cleanly if this exact certificate is already present.
+        # Comparing SHA-256 fingerprints avoids relying on Google's error wording.
+        target_fp = cert.fingerprint(hashes.SHA256())
+        try:
+            existing = smime_api.list(
+                userId="me", sendAsEmail=matching_alias
+            ).execute(num_retries=API_NUM_RETRIES)
+            for info in existing.get("smimeInfo", []):
+                pem = info.get("pem")
+                if not pem:
+                    continue
+                try:
+                    existing_cert = x509.load_pem_x509_certificate(pem.encode("utf-8"))
+                except Exception:
+                    continue
+                if existing_cert.fingerprint(hashes.SHA256()) == target_fp:
+                    result["status"] = "ALREADY_EXISTS"
+                    result["cert_id"] = info.get("id", "")
+                    result["reason"] = "Certificate already uploaded — skipping."
+                    logger.info("  Certificate already exists for %s — skipping.", matching_alias)
+                    return result
+        except HttpError as he:
+            # Non-fatal: fall through to insert, which still guards duplicates below.
+            logger.debug("  Could not list existing smimeInfo (%s); proceeding to insert.", he)
 
+        # Build upload payload
         smime_body = {"pkcs12": base64.urlsafe_b64encode(raw_data).decode("utf-8")}
         if password:
             smime_body["encryptedKeyPassword"] = password
@@ -223,11 +297,9 @@ def process_certificate_file(
         # Insert S/MIME certificate
         logger.info("  Uploading S/MIME key for alias: %s ...", matching_alias)
         try:
-            insert_result = (
-                service.users().settings().sendAs().smimeInfo()
-                .insert(userId="me", sendAsEmail=matching_alias, body=smime_body)
-                .execute()
-            )
+            insert_result = smime_api.insert(
+                userId="me", sendAsEmail=matching_alias, body=smime_body
+            ).execute(num_retries=API_NUM_RETRIES)
         except HttpError as he:
             error_content = he.error_details if hasattr(he, "error_details") else str(he)
             if he.resp.status == 400:
@@ -264,9 +336,9 @@ def process_certificate_file(
         # Optionally set as default
         if set_default and cert_id:
             logger.info("  Setting cert %s as default...", cert_id)
-            service.users().settings().sendAs().smimeInfo().setDefault(
+            smime_api.setDefault(
                 userId="me", sendAsEmail=matching_alias, id=cert_id
-            ).execute()
+            ).execute(num_retries=API_NUM_RETRIES)
             logger.info("  Set as default successfully.")
 
         result["status"] = "SUCCESS"
@@ -295,41 +367,33 @@ def write_csv_report(results: list, output_dir: Path) -> Path:
     return csv_path
 
 
-def main() -> None:
-    args = parse_args()
+def run_sync(
+    certs_dir: Path,
+    credentials_path: str | None,
+    password: str,
+    dry_run: bool,
+    set_default: bool,
+) -> dict:
+    """
+    Scans certs_dir for .p12/.pfx files and uploads each to Google Workspace.
+    Loads service-account credentials once and impersonates per-user, applies a
+    per-certificate password manifest (passwords.csv) with global fallback, and
+    writes a CSV report on live runs.
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-
-    # Password: CLI arg takes precedence over env var
-    password = args.password or os.environ.get("SMIME_PASSWORD", "") or ""
-
-    # ── Validate inputs ────────────────────────────────────────────────────────
-    certs_dir = Path(args.directory)
-    if not certs_dir.exists() or not certs_dir.is_dir():
-        logger.error("Certificates directory not found: %s", args.directory)
-        sys.exit(1)
-
-    credentials_path = Path(args.credentials)
-    if not args.dry_run:
-        if not credentials_path.exists():
-            logger.error("Credentials file not found: %s", args.credentials)
-            sys.exit(1)
-        try:
-            creds_info = validate_credentials_file(credentials_path)
-            logger.info("Credentials validated. Client ID: %s", creds_info["client_id"])
-        except (ValueError, Exception) as exc:
-            logger.error("Credentials file is invalid: %s", exc)
-            sys.exit(1)
-
+    Shared by the CLI (main) and the GUI worker. Returns a summary dict:
+    {"results", "success", "failed", "already", "total"}. Raises on
+    unrecoverable setup errors (e.g. invalid credentials) so callers can abort.
+    """
     logger.info("=" * 50)
-    logger.info("Starting S/MIME Google Workspace Sync Script")
+    logger.info("Starting S/MIME Google Workspace Sync")
     logger.info("Directory   : %s", certs_dir.resolve())
-    if args.dry_run:
+    if dry_run:
         logger.info("MODE        : DRY-RUN (local validation only)")
     else:
-        logger.info("Credentials : %s", credentials_path.resolve())
+        logger.info("Credentials : %s", Path(credentials_path).resolve())
     logger.info("=" * 50)
+
+    empty = {"results": [], "success": 0, "failed": 0, "already": 0, "total": 0}
 
     # ── Scan for certificate files ─────────────────────────────────────────────
     cert_files: list[Path] = []
@@ -338,9 +402,21 @@ def main() -> None:
 
     if not cert_files:
         logger.warning("No .p12 or .pfx files found in: %s", certs_dir.resolve())
-        sys.exit(0)
+        return empty
 
     logger.info("Found %d certificate file(s).", len(cert_files))
+
+    # Per-certificate passwords (filename -> password), with global fallback.
+    password_map = load_password_manifest(certs_dir)
+
+    # Load service-account credentials ONCE; per-user impersonation is derived
+    # later via with_subject(), avoiding a disk read/parse per certificate.
+    base_credentials = None
+    if not dry_run:
+        validate_credentials_file(Path(credentials_path))
+        base_credentials = service_account.Credentials.from_service_account_file(
+            credentials_path, scopes=SCOPES
+        )
 
     results = []
     success_count = 0
@@ -348,12 +424,13 @@ def main() -> None:
     already_count = 0
 
     for file_path in sorted(cert_files):
+        file_password = password_map.get(file_path.name, password)
         result = process_certificate_file(
             file_path=file_path,
-            password=password,
-            credentials_path=str(credentials_path),
-            dry_run=args.dry_run,
-            set_default=args.default,
+            password=file_password,
+            base_credentials=base_credentials,
+            dry_run=dry_run,
+            set_default=set_default,
         )
         results.append(result)
 
@@ -382,10 +459,53 @@ def main() -> None:
         logger.info("  [%s] %-40s %s  %s", icon, r["email"] or r["file"], r["status"], r["reason"])
     logger.info("=" * 50)
 
-    if not args.dry_run:
+    if not dry_run:
         write_csv_report(results, certs_dir)
 
-    sys.exit(1 if fail_count > 0 else 0)
+    return {
+        "results": results,
+        "success": success_count,
+        "failed": fail_count,
+        "already": already_count,
+        "total": len(cert_files),
+    }
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    # Password: CLI arg takes precedence over env var
+    password = args.password or os.environ.get("SMIME_PASSWORD", "") or ""
+
+    # ── Validate inputs ────────────────────────────────────────────────────────
+    certs_dir = Path(args.directory)
+    if not certs_dir.exists() or not certs_dir.is_dir():
+        logger.error("Certificates directory not found: %s", args.directory)
+        sys.exit(1)
+
+    credentials_path = Path(args.credentials)
+    if not args.dry_run and not credentials_path.exists():
+        logger.error("Credentials file not found: %s", args.credentials)
+        sys.exit(1)
+
+    try:
+        summary = run_sync(
+            certs_dir=certs_dir,
+            credentials_path=str(credentials_path),
+            password=password,
+            dry_run=args.dry_run,
+            set_default=args.default,
+        )
+    except Exception as exc:
+        logger.error("Sync aborted: %s", exc)
+        if logger.isEnabledFor(logging.DEBUG):
+            traceback.print_exc()
+        sys.exit(1)
+
+    sys.exit(1 if summary["failed"] > 0 else 0)
 
 
 if __name__ == "__main__":

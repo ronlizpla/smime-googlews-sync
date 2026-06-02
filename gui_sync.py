@@ -234,68 +234,18 @@ class SMIMEGuiApp(ctk.CTk):
         set_default: bool,
     ) -> None:
         try:
-            sync_smime.logger.info("=" * 50)
-            sync_smime.logger.info("Starting S/MIME Workspace Sync GUI Worker")
-            sync_smime.logger.info("Directory   : %s", certs_dir.resolve())
-            if dry_run:
-                sync_smime.logger.info("MODE        : DRY-RUN (local validation only)")
-            else:
-                sync_smime.logger.info("Credentials : %s", Path(creds_path).resolve())
-            sync_smime.logger.info("=" * 50)
-
-            # Scan for certificate files
-            cert_files = []
-            for ext in ("*.p12", "*.pfx"):
-                cert_files.extend(certs_dir.glob(ext))
-
-            if not cert_files:
-                sync_smime.logger.warning("No .p12 or .pfx files found in: %s", certs_dir.resolve())
-                self._finalize_sync(0, 0, 0, [])
-                return
-
-            sync_smime.logger.info("Found %d certificate file(s).", len(cert_files))
-
-            results = []
-            success_count = 0
-            fail_count = 0
-            already_count = 0
-
-            for file_path in sorted(cert_files):
-                result = sync_smime.process_certificate_file(
-                    file_path=file_path,
-                    password=password,
-                    credentials_path=creds_path,
-                    dry_run=dry_run,
-                    set_default=set_default,
-                )
-                results.append(result)
-
-                if result["status"] in ("SUCCESS", "DRY-RUN"):
-                    success_count += 1
-                elif result["status"] == "ALREADY_EXISTS":
-                    already_count += 1
-                    success_count += 1
-                else:
-                    fail_count += 1
-
-            sync_smime.logger.info("=" * 50)
-            sync_smime.logger.info("Sync Execution Report:")
-            sync_smime.logger.info("  Total Processed : %d", len(cert_files))
-            already_note = f" ({already_count} already existed)" if already_count else ""
-            sync_smime.logger.info("  Successful      : %d%s", success_count, already_note)
-            sync_smime.logger.info("  Failed          : %d", fail_count)
-            for r in results:
-                icon = "+" if r["status"] in ("SUCCESS", "ALREADY_EXISTS") else ("~" if r["status"] == "DRY-RUN" else "x")
-                sync_smime.logger.info("  [%s] %-40s %s  %s", icon, r["email"] or r["file"], r["status"], r["reason"])
-            sync_smime.logger.info("=" * 50)
-
-            if not dry_run:
-                sync_smime.write_csv_report(results, certs_dir)
-
-            self._finalize_sync(success_count, fail_count, already_count, results)
-
+            summary = sync_smime.run_sync(
+                certs_dir=certs_dir,
+                credentials_path=creds_path or None,
+                password=password,
+                dry_run=dry_run,
+                set_default=set_default,
+            )
+            self._finalize_sync(
+                summary["success"], summary["failed"], summary["already"], summary["results"]
+            )
         except Exception as e:
-            sync_smime.logger.error("An unexpected error occurred in the worker thread: %s", e)
+            sync_smime.logger.error("Sync aborted: %s", e)
             self._finalize_sync(0, 0, 0, [])
 
     def _finalize_sync(self, success: int, failed: int, already: int, results: list) -> None:

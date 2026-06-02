@@ -3,6 +3,9 @@ credentials.json
 *.json
 !requirements*.json
 
+# Per-certificate password manifest - contains plaintext passwords
+passwords.csv
+
 # Certificate files - sensitive private keys
 *.p12
 *.pfx

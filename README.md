@@ -78,6 +78,19 @@ $env:SMIME_PASSWORD="your-secure-p12-password"
 python sync_smime.py -c credentials.json -d C:\path\to\certs --default
 ```
 
+### Per-certificate passwords (`passwords.csv`)
+When each PFX has a different password, drop a `passwords.csv` file **in the same folder as the certificates** with the headers `file,password`:
+
+```csv
+file,password
+alice.pfx,Pa$$w0rd-alice
+bob.pfx,S3cret!-bob
+```
+
+- Any certificate **not** listed falls back to the global password (`--password` / `SMIME_PASSWORD`).
+- The manifest is applied automatically by both the CLI and the GUI — no extra flags.
+- It is excluded from git via the `passwords.csv` ignore rule; delete it after the import, as it holds plaintext passwords.
+
 ---
 
 ## 5. Desktop GUI Interface
