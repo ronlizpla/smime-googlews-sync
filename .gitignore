@@ -39,6 +39,13 @@ Thumbs.db
 *.exe
 *.msi
 
+# Archives / bundles
+*.zip
+
+# Third-party tooling & vendored deps (not part of this project)
+cert/uptime-kuma/
+cert/node-v20.12.2-win-x64/
+
 # Generated reports & workspace packages
 *smime_sync_report*.csv
 cert/workspace_packages/
