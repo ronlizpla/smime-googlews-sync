@@ -69,6 +69,10 @@ def parse_args() -> argparse.Namespace:
                         help="Directory containing .p12 or .pfx certificate files.")
     parser.add_argument("--password", "-p", default=None,
                         help="PKCS#12 decryption password. Prefer SMIME_PASSWORD env var.")
+    parser.add_argument("--password-csv", default=None,
+                        help="Explicit path to a per-certificate password CSV (columns: "
+                             "file and/or email, plus password). Overrides the auto-discovered "
+                             "passwords.csv in the certificate directory.")
     parser.add_argument("--default", action="store_true",
                         help="Set uploaded certificate as default S/MIME key for the user.")
     parser.add_argument("--dry-run", action="store_true",
@@ -112,31 +116,56 @@ def extract_p12_info(p12_data: bytes, password: bytes) -> tuple:
     raise ValueError("No valid email address found in SAN or CN of the certificate.")
 
 
-def load_password_manifest(certs_dir: Path) -> dict:
+def load_password_manifest(certs_dir: Path, explicit_path: Path | None = None) -> dict:
     """
-    Reads an optional `passwords.csv` (headers: file,password) from certs_dir,
-    mapping each certificate filename to its PKCS#12 password. Files not listed
-    fall back to the global password. Returns {} if no manifest is present.
-    """
-    manifest_path = certs_dir / PASSWORD_MANIFEST_NAME
-    mapping: dict = {}
-    if not manifest_path.exists():
-        return mapping
+    Reads a per-certificate password manifest and maps each certificate to its
+    PKCS#12 password. Files not listed fall back to the global password.
 
+    Source resolution:
+      - If `explicit_path` is given (e.g. CLI --password-csv / GUI picker), it is
+        used and must exist.
+      - Otherwise an optional `passwords.csv` in `certs_dir` is auto-discovered.
+
+    Accepted headers (case-insensitive): a `password` column plus at least one of
+    `file` (certificate filename) and/or `email` (the address inside the cert).
+    Both lookup keys are merged into a single mapping, so either a filename or an
+    email-named file (e.g. `user@example.com.pfx`) resolves correctly. Returns {}
+    if no manifest is present.
+    """
+    if explicit_path is not None:
+        manifest_path = explicit_path
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Password CSV not found: {manifest_path}")
+    else:
+        manifest_path = certs_dir / PASSWORD_MANIFEST_NAME
+        if not manifest_path.exists():
+            return {}
+
+    mapping: dict = {}
     # utf-8-sig strips the BOM that Excel prepends when saving CSVs.
     with open(manifest_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         headers = [h.strip().lower() for h in (reader.fieldnames or [])]
-        if "file" not in headers:
+        if "password" not in headers:
             logger.warning(
-                "%s found but missing a 'file' column — ignoring it.", PASSWORD_MANIFEST_NAME
+                "%s found but missing a 'password' column — ignoring it.", manifest_path.name
+            )
+            return mapping
+        if "file" not in headers and "email" not in headers:
+            logger.warning(
+                "%s found but has no 'file' or 'email' column — ignoring it.", manifest_path.name
             )
             return mapping
         for row in reader:
             row_l = {(k.strip().lower() if k else k): (v or "") for k, v in row.items()}
+            pw = row_l.get("password", "")
             fname = row_l.get("file", "").strip()
+            email = row_l.get("email", "").strip()
             if fname:
-                mapping[fname] = row_l.get("password", "")
+                mapping[fname] = pw
+            if email:
+                # Allow matching files literally named after the email.
+                mapping[email] = pw
 
     logger.info("Loaded password manifest with %d entr%s.",
                 len(mapping), "y" if len(mapping) == 1 else "ies")
@@ -373,6 +402,7 @@ def run_sync(
     password: str,
     dry_run: bool,
     set_default: bool,
+    password_csv: Path | None = None,
 ) -> dict:
     """
     Scans certs_dir for .p12/.pfx files and uploads each to Google Workspace.
@@ -406,8 +436,10 @@ def run_sync(
 
     logger.info("Found %d certificate file(s).", len(cert_files))
 
-    # Per-certificate passwords (filename -> password), with global fallback.
-    password_map = load_password_manifest(certs_dir)
+    # Per-certificate passwords (filename/email -> password), with global fallback.
+    # An explicit --password-csv (password_csv) overrides the auto-discovered
+    # passwords.csv inside certs_dir.
+    password_map = load_password_manifest(certs_dir, explicit_path=password_csv)
 
     # Load service-account credentials ONCE; per-user impersonation is derived
     # later via with_subject(), avoiding a disk read/parse per certificate.
@@ -424,7 +456,12 @@ def run_sync(
     already_count = 0
 
     for file_path in sorted(cert_files):
-        file_password = password_map.get(file_path.name, password)
+        # Match by exact filename first, then by stem (covers files literally
+        # named after the email, e.g. user@example.com.pfx), else global password.
+        file_password = password_map.get(
+            file_path.name,
+            password_map.get(file_path.stem, password),
+        )
         result = process_certificate_file(
             file_path=file_path,
             password=file_password,
@@ -491,6 +528,11 @@ def main() -> None:
         logger.error("Credentials file not found: %s", args.credentials)
         sys.exit(1)
 
+    password_csv = Path(args.password_csv) if args.password_csv else None
+    if password_csv and not password_csv.exists():
+        logger.error("Password CSV not found: %s", args.password_csv)
+        sys.exit(1)
+
     try:
         summary = run_sync(
             certs_dir=certs_dir,
@@ -498,6 +540,7 @@ def main() -> None:
             password=password,
             dry_run=args.dry_run,
             set_default=args.default,
+            password_csv=password_csv,
         )
     except Exception as exc:
         logger.error("Sync aborted: %s", exc)
