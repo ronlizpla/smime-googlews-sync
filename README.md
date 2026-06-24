@@ -1,5 +1,10 @@
 # S/MIME Google Workspace Automation Script
 
+> 📘 **New here? Read the master guide first:
+> [`smime-pipeline/END-TO-END.md`](../smime-pipeline/END-TO-END.md)** — it walks
+> the full pull→push flow. This README is the detailed reference for the **push**
+> step (sections 2–5).
+
 A production-grade Python tool designed to automate loading and assigning S/MIME IV (Individual Validated) certificates from a local directory directly into user accounts across any Google Workspace tenant.
 
 ---
@@ -10,6 +15,24 @@ Google Workspace enforces strict validation policies for custom S/MIME Root Cert
 *   **Chain Bundling**: The final PKCS#12 (`.p12` or `.pfx`) file uploaded for each user must contain their private key, user certificate, and the intermediate certificate chain.
 
 The included certificate generation utility in [cert/](file:///c:/Users/Ron/OneDrive/Documents/smime-google-sync/cert) automatically implements this three-tier PKI layout (`Root CA` -> `Intermediate CA` -> `User Certificate`).
+
+---
+
+## 1b. Importing certificates from SSL.com (the PULL step)
+
+> ⚠️ **The pull step lives in the separate `sslcom-smime-import` tool, and the
+> instructions below were superseded.** The production flow no longer uses
+> per-user manual DCV email approval or product 300 — it uses SSL.com's
+> **registrant-reuse** model (orders come back `validated` instantly, product
+> 600, 3-year certs).
+>
+> 👉 **For the current, correct pull instructions see the master guide:
+> [`smime-pipeline/END-TO-END.md`](../smime-pipeline/END-TO-END.md) → PART A**
+> (or `sslcom-smime-import/HANDOFF.md`). This README covers the **push** step
+> (sections 2–5 below), which is current.
+
+The pull step produces the exact `.p12` + `passwords.csv` folder that
+`sync_smime.py` consumes (the durable handoff between the two tools).
 
 ---
 
