@@ -1,0 +1,3 @@
+email,common_name,first_name,last_name,phone,organization,organization_unit,street_address_1,locality,state_or_providence,postal_code,country
+alice@example.com,Alice Anderson,Alice,Anderson,+15125550101,Example Corp,IT,123 Main St,Austin,TX,78701,US
+bob@example.com,Bob Brown,Bob,Brown,+15125550102,Example Corp,Sales,123 Main St,Austin,TX,78701,US
